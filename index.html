@@ -165,10 +165,11 @@ async function readTop(file){
   return out;
 }
 /* Adds an MP3 audio track to an MP4 without touching the video data; hides the old sound track. Returns a Blob. */
-async function muxMp4(file,mp3){
+async function muxMp4(file,mp3,secs0){
   const{fr:all,info}=mp3frames(mp3);
   if(!all.length)throw new Error('no audio frames');
-  const total=file.size,mo=(await readTop(file)).filter(b=>b.k==='moov');
+  const total=file.size,top=await readTop(file),mo=top.filter(b=>b.k==='moov');
+  if(top.some(b=>b.k==='moof'))throw new Error('fragmented mp4');
   if(!mo.length)throw new Error('can’t read this video');
   const ms=mo[mo.length-1].s,mh=mo[mo.length-1].h,mz=mo[mo.length-1].z;
   const m=new Uint8Array(await file.slice(ms+mh,ms+mz).arrayBuffer()),dv=new DataView(m.buffer);
@@ -187,7 +188,8 @@ async function muxMp4(file,mp3){
     }
   }
   const tid=(dv.getUint32(mv.s+mv.z-4)||100);dv.setUint32(mv.s+mv.z-4,tid+1);
-  const{v:ver,sr,ch,spf}=info,need=Math.ceil(dur/mts*sr/spf),fr=all.slice(0,need);
+  const{v:ver,sr,ch,spf}=info,secs=Math.max(secs0||0,dur/mts),need=Math.ceil(secs*sr/spf),fr=all.slice(0,need);
+  if(secs*mts>dur){const o=mv.s+mv.h,nd=Math.ceil(secs*mts);if(m[o]===1)dv.setBigUint64(o+24,BigInt(nd));else dv.setUint32(o+16,nd>>>0)}
   const cnt=fr.length,nsamp=cnt*spf,off=total+8;
   const es=cat(U16(0),Z(1),Uint8Array.of(4,13,ver===3?0x6B:0x69,0x15),Z(3),U32(0,0),Uint8Array.of(6,1,2));
   const esds=fbox('esds',cat(Uint8Array.of(3,es.length),es));
@@ -340,6 +342,9 @@ $('pl').onclick=async()=>{if(!vdur)return;ensureAudio();await AC.resume();v.paus
 $('rs').onclick=()=>{v.currentTime=0;head()};
 
 /* ---------- fast export: mix offline, encode MP3, add to the original MP4 ---------- */
+function probe(b){return new Promise(res=>{const x=document.createElement('video'),u=URL.createObjectURL(b);let done=false;
+  const end=d=>{if(done)return;done=true;URL.revokeObjectURL(u);x.removeAttribute('src');res(d)};
+  x.preload='metadata';x.onloadedmetadata=()=>end(x.duration);x.onerror=()=>end(0);setTimeout(()=>end(0),8000);x.src=u})}
 const tick=()=>new Promise(r=>setTimeout(r));
 async function fastExport(){
   const SR=44100,len=Math.ceil(vdur*SR),oc=new OfflineAudioContext(2,len,SR);let note='';
@@ -352,17 +357,17 @@ async function fastExport(){
   for(const c of clips)await add(c.file,Math.max(0,c.start),c.vol);
   $('exp').textContent='Mixing…';await tick();
   const out=await oc.startRendering(),L=out.getChannelData(0),R=out.numberOfChannels>1?out.getChannelData(1):L;
-  const cl=x=>x<-1?-32768:x>1?32767:Math.round(x*32767),enc=new lamejs.Mp3Encoder(2,SR,160),parts=[],B=1152*16;
+  const cl=x=>x<-1?-32768:x>1?32767:Math.round(x*32767),enc=new lamejs.Mp3Encoder(2,SR,128),parts=[],B=1152;
   const keep=o=>{if(o&&o.length)parts.push(new Uint8Array(o.buffer.slice(o.byteOffset,o.byteOffset+o.length)))};
   for(let i=0,k=0;i<len;i+=B,k++){
     const n=Math.min(B,len-i),l=new Int16Array(n),r=new Int16Array(n);
     for(let j=0;j<n;j++){l[j]=cl(L[i+j]);r[j]=cl(R[i+j])}
     keep(enc.encodeBuffer(l,r));
-    if(k%8===0){$('exp').textContent='Encoding '+Math.round(i/len*100)+'%';await tick()}
+    if(k%48===0){$('exp').textContent='Encoding '+Math.round(i/len*100)+'%';await tick()}
   }
   keep(enc.flush());
   $('exp').textContent='Finishing…';await tick();
-  return{blob:await muxMp4(vfile,cat(...parts)),note};
+  return{blob:await muxMp4(vfile,cat(...parts),vdur),note};
 }
 
 /* ---------- fallback export: records the preview in real time ---------- */
@@ -387,7 +392,11 @@ $('exp').onclick=async()=>{
   try{
     if(typeof lamejs==='undefined'||typeof OfflineAudioContext==='undefined')throw new Error('fast encoder not available');
     status('Exporting… this is much faster than real time.');
-    const r=await fastExport();finish(r.blob,'mp4',r.note);
+    const r=await fastExport();
+    $('exp').textContent='Checking…';
+    const d=await probe(r.blob);
+    if(d&&isFinite(d)&&d<vdur-2)throw new Error('output came out short ('+fmt(d)+' of '+fmt(vdur)+')');
+    finish(r.blob,'mp4',r.note);
   }catch(err){
     console.warn(err);status('Fast export failed ('+(err&&err.message||err)+'). Switching to real-time export…');
     try{await realtimeExport()}catch(e2){busy=false;$('exp').disabled=false;$('exp').textContent='Export';status('Export failed: '+(e2&&e2.message||e2))}
